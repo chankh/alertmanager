@@ -302,6 +302,7 @@ var DefaultGlobalConfig = GlobalConfig{
 	HipchatURL:      "https://api.hipchat.com/",
 	OpsGenieAPIHost: "https://api.opsgenie.com/",
 	VictorOpsAPIURL: "https://alert.victorops.com/integrations/generic/20131114/alert/",
+	MaaiiAPIURL:     "https://api.maaii.com/",
 }
 
 // GlobalConfig defines configuration parameters that are valid globally
@@ -326,6 +327,7 @@ type GlobalConfig struct {
 	OpsGenieAPIHost  string `yaml:"opsgenie_api_host,omitempty" json:"opsgenie_api_host,omitempty"`
 	VictorOpsAPIURL  string `yaml:"victorops_api_url,omitempty" json:"victorops_api_url,omitempty"`
 	VictorOpsAPIKey  Secret `yaml:"victorops_api_key,omitempty" json:"victorops_api_key,omitempty"`
+	MaaiiAPIURL      string `yaml:"maaii_api_url"`
 
 	// Catches all undefined fields and must be empty after parsing.
 	XXX map[string]interface{} `yaml:",inline" json:"-"`
@@ -461,6 +463,7 @@ type Receiver struct {
 	OpsGenieConfigs  []*OpsGenieConfig  `yaml:"opsgenie_configs,omitempty" json:"opsgenie_configs,omitempty"`
 	PushoverConfigs  []*PushoverConfig  `yaml:"pushover_configs,omitempty" json:"pushover_configs,omitempty"`
 	VictorOpsConfigs []*VictorOpsConfig `yaml:"victorops_configs,omitempty" json:"victorops_configs,omitempty"`
+	MaaiiConfigs     []*MaaiiConfig     `yaml:"maaii_configs,omitempty"`
 
 	// Catches all undefined fields and must be empty after parsing.
 	XXX map[string]interface{} `yaml:",inline" json:"-"`

@@ -133,6 +133,10 @@ func BuildReceiverIntegrations(nc *config.Receiver, tmpl *template.Template, log
 		n := NewPushover(c, tmpl, logger)
 		add("pushover", i, n, c)
 	}
+	for i, c := range nc.MaaiiConfigs {
+		n := NewMaaii(c, tmpl)
+		add("maaii", i, n, c)
+	}
 	return integrations
 }
 
@@ -764,7 +768,7 @@ func (n *OpsGenie) Notify(ctx context.Context, as ...*types.Alert) (bool, error)
 	default:
 		message := tmpl(n.conf.Message)
 		if len(message) > 130 {
-			message = message[:127]+"..."
+			message = message[:127] + "..."
 			level.Debug(n.logger).Log("msg", "Truncated message to %q due to OpsGenie message limit", "truncated_message", message, "incident", key)
 		}
 
@@ -1044,6 +1048,79 @@ func (n *Pushover) Notify(ctx context.Context, as ...*types.Alert) (bool, error)
 		return false, fmt.Errorf("unexpected status code %v (body: %s)", resp.StatusCode, string(body))
 	}
 
+	return false, nil
+}
+
+// Maaii implements a notifier for Maaii notifications
+type Maaii struct {
+	conf   *config.MaaiiConfig
+	tmpl   *template.Template
+	logger log.Logger
+}
+
+// NewMaaii returns a new Maaii notifier
+func NewMaaii(c *config.MaaiiConfig, t *template.Template) *Maaii {
+	return &Maaii{conf: c, tmpl: t}
+}
+
+type maaiiNotificationRequest struct {
+	Type                 string `json:"@type"`
+	Username             string `json:"username"`
+	CarrierName          string `json:"carrierName"`
+	SendAsPush           bool   `json:"sendAsPushMessage"`
+	PushNotificationText string `json:"pushNotificationText"`
+	SendAsMessage        bool   `json:"sendAsApplicationMessage"`
+	MessageText          string `json:"applicationNotificationText"`
+}
+
+// Notify implements the Notifier interface
+func (n *Maaii) Notify(ctx context.Context, as ...*types.Alert) (bool, error) {
+	var err error
+	var (
+		data     = n.tmpl.Data(receiverName(ctx, n.logger), groupLabels(ctx, n.logger), as...)
+		tmplText = tmplText(n.tmpl, data, &err)
+	)
+
+	if err != nil {
+		return false, fmt.Errorf("templating error: %s", err)
+	}
+
+	subject := tmplText(n.conf.Message)
+	msg := fmt.Sprintf("%s\n%s\nSource: %s",
+		subject, tmplText(n.conf.Description), tmplText(n.conf.Source))
+	for _, user := range n.conf.Recipients {
+		req := &maaiiNotificationRequest{
+			Type:                 "Custom",
+			Username:             user,
+			CarrierName:          n.conf.Carrier,
+			SendAsPush:           true,
+			PushNotificationText: subject,
+			SendAsMessage:        true,
+			MessageText:          msg,
+		}
+		if err != nil {
+			return false, err
+		}
+
+		apiURL := "http://192.168.118.20:43185/v1.0/MaaiiNotification/dispatch"
+		level.Info(n.logger).Log("msg", "Sending Maaii notification", "url", apiURL, "request", req)
+		var buf bytes.Buffer
+		if err := json.NewEncoder(&buf).Encode(req); err != nil {
+			level.Error(n.logger).Log("msg", "Unable to encode JSON", "err", err)
+			return false, err
+		}
+
+		resp, err := ctxhttp.Post(ctx, http.DefaultClient, apiURL, contentTypeJSON, &buf)
+		if err != nil {
+			level.Error(n.logger).Log("msg", "Unable to POST request", "err", err)
+			return true, err
+		}
+
+		defer resp.Body.Close()
+
+		return false, nil
+
+	}
 	return false, nil
 }
 

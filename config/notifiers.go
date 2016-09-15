@@ -117,6 +117,15 @@ var (
 		Retry:    duration(1 * time.Minute),
 		Expire:   duration(1 * time.Hour),
 	}
+	// DefaultMaaiiConfig defines default values for Maaii configurations.
+	DefaultMaaiiConfig = MaaiiConfig{
+		NotifierConfig: NotifierConfig{
+			VSendResolved: true,
+		},
+		Message:     `{{ template "maaii.default.message" . }}`,
+		Description: `{{ template "maaii.default.description" . }}`,
+		Source:      `{{ template "maaii.default.source" . }}`,
+	}
 )
 
 // NotifierConfig contains base options common across all notifier configurations.
@@ -394,4 +403,35 @@ func (c *PushoverConfig) UnmarshalYAML(unmarshal func(interface{}) error) error 
 		return fmt.Errorf("missing token in Pushover config")
 	}
 	return checkOverflow(c.XXX, "pushover config")
+}
+
+type MaaiiConfig struct {
+	NotifierConfig `yaml:",inline"`
+
+	DeveloperKey    Secret   `yaml:"developer_key"`
+	DeveloperSecret Secret   `yaml:"developer_secret"`
+	Carrier         string   `yaml:"carrier"`
+	Recipients      []string `yaml:"recipients"`
+	Message         string   `yaml:"message"`
+	Description     string   `yaml:"description"`
+	Source          string   `yaml:"source"`
+
+	// Catches all undefined fields and must be empty after parsing.
+	XXX map[string]interface{} `yaml:",inline"`
+}
+
+// UnmarshalYAML implements the yaml.Unmarshaler interface
+func (c *MaaiiConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	*c = DefaultMaaiiConfig
+	type plain MaaiiConfig
+	if err := unmarshal((*plain)(c)); err != nil {
+		return err
+	}
+	if c.DeveloperKey == "" {
+		return fmt.Errorf("missing developer key in the Maaii config")
+	}
+	if c.DeveloperSecret == "" {
+		return fmt.Errorf("missing developer secret in the Maaii config")
+	}
+	return checkOverflow(c.XXX, "maaii config")
 }
