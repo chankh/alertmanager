@@ -24,6 +24,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -103,6 +104,11 @@ func newMarkerMetrics(marker types.Marker) {
 }
 
 func main() {
+	if os.Getenv("DEBUG") != "" {
+		runtime.SetBlockProfileRate(20)
+		runtime.SetMutexProfileFraction(20)
+	}
+
 	var (
 		showVersion = flag.Bool("version", false, "Print version information.")
 
@@ -232,8 +238,10 @@ func main() {
 
 	defer func() {
 		close(stopc)
-		// Stop receiving updates from router before shutting down.
-		mrouter.Stop()
+		if *meshListen != "" {
+			// Stop receiving updates from router before shutting down.
+			mrouter.Stop()
+		}
 		wg.Wait()
 	}()
 

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/prometheus/alertmanager/types"
+	"github.com/prometheus/common/model"
 	"github.com/spf13/cobra"
 	flag "github.com/spf13/pflag"
 	"github.com/spf13/viper"
@@ -85,10 +86,10 @@ func add(cmd *cobra.Command, args []string) error {
 	}
 
 	if len(matchers) < 1 {
-		return fmt.Errorf("No matchers specified")
+		return fmt.Errorf("no matchers specified")
 	}
 
-	expire_on, err := addFlags.GetString("expire-on")
+	expireOn, err := addFlags.GetString("expire-on")
 	if err != nil {
 		return err
 	}
@@ -96,25 +97,28 @@ func add(cmd *cobra.Command, args []string) error {
 	expires := viper.GetString("expires")
 	var endsAt time.Time
 
-	if expire_on != "" {
-		endsAt, err = time.Parse(time.RFC3339, expire_on)
+	if expireOn != "" {
+		endsAt, err = time.Parse(time.RFC3339, expireOn)
 		if err != nil {
 			return err
 		}
 	} else {
-		duration, err := time.ParseDuration(expires)
+		duration, err := model.ParseDuration(expires)
 		if err != nil {
 			return err
 		}
-		endsAt = time.Now().UTC().Add(duration)
+		if duration == 0 {
+			return fmt.Errorf("silence duration must be greater than 0")
+		}
+		endsAt = time.Now().UTC().Add(time.Duration(duration))
 	}
 
 	author := viper.GetString("author")
 	comment := viper.GetString("comment")
-	comment_required := viper.GetBool("comment_required")
+	commentRequired := viper.GetBool("comment_required")
 
-	if comment_required && comment == "" {
-		return errors.New("Comment required by config")
+	if commentRequired && comment == "" {
+		return errors.New("comment required by config")
 	}
 
 	typeMatchers, err := TypeMatchers(matchers)
@@ -151,7 +155,7 @@ func add(cmd *cobra.Command, args []string) error {
 	response := addResponse{}
 	err = json.NewDecoder(res.Body).Decode(&response)
 	if err != nil {
-		return errors.New(fmt.Sprintf("Unable to parse silence json response from %s", u.String()))
+		return fmt.Errorf("unable to parse silence json response from %s", u.String())
 	}
 
 	if response.Status == "error" {

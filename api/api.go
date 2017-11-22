@@ -263,8 +263,8 @@ func (api *API) alertGroups(w http.ResponseWriter, r *http.Request) {
 
 func (api *API) listAlerts(w http.ResponseWriter, r *http.Request) {
 	var (
-		err error
-		re  *regexp.Regexp
+		err            error
+		receiverFilter *regexp.Regexp
 		// Initialize result slice to prevent api returning `null` when there
 		// are no alerts present
 		res           = []*dispatch.APIAlert{}
@@ -315,7 +315,7 @@ func (api *API) listAlerts(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if receiverParam := r.FormValue("receiver"); receiverParam != "" {
-		re, err = regexp.Compile("^(?:" + receiverParam + ")$")
+		receiverFilter, err = regexp.Compile("^(?:" + receiverParam + ")$")
 		if err != nil {
 			api.respondError(w, apiError{
 				typ: errorBadData,
@@ -343,7 +343,7 @@ func (api *API) listAlerts(w http.ResponseWriter, r *http.Request) {
 			receivers = append(receivers, r.RouteOpts.Receiver)
 		}
 
-		if re != nil && !regexpAny(re, receivers) {
+		if receiverFilter != nil && !receiversMatchFilter(receivers, receiverFilter) {
 			continue
 		}
 
@@ -389,9 +389,9 @@ func (api *API) listAlerts(w http.ResponseWriter, r *http.Request) {
 	api.respond(w, res)
 }
 
-func regexpAny(re *regexp.Regexp, ss []string) bool {
-	for _, s := range ss {
-		if re.MatchString(s) {
+func receiversMatchFilter(receivers []string, filter *regexp.Regexp) bool {
+	for _, r := range receivers {
+		if filter.MatchString(r) {
 			return true
 		}
 	}
@@ -400,13 +400,11 @@ func regexpAny(re *regexp.Regexp, ss []string) bool {
 }
 
 func alertMatchesFilterLabels(a *model.Alert, matchers []*labels.Matcher) bool {
-	for _, m := range matchers {
-		if v, prs := a.Labels[model.LabelName(m.Name)]; !prs || !m.Matches(string(v)) {
-			return false
-		}
+	sms := make(map[string]string)
+	for name, value := range a.Labels {
+		sms[string(name)] = string(value)
 	}
-
-	return true
+	return matchFilterLabels(matchers, sms)
 }
 
 func (api *API) legacyAddAlerts(w http.ResponseWriter, r *http.Request) {
@@ -610,21 +608,21 @@ func (api *API) listSilences(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		if !matchesFilterLabels(s, matchers) {
+		if !silenceMatchesFilterLabels(s, matchers) {
 			continue
 		}
 		sils = append(sils, s)
 	}
 
-	var active, pending, expired, silences []*types.Silence
+	var active, pending, expired []*types.Silence
 
 	for _, s := range sils {
 		switch s.Status.State {
-		case "active":
+		case types.SilenceStateActive:
 			active = append(active, s)
-		case "pending":
+		case types.SilenceStatePending:
 			pending = append(pending, s)
-		case "expired":
+		case types.SilenceStateExpired:
 			expired = append(expired, s)
 		}
 	}
@@ -639,6 +637,9 @@ func (api *API) listSilences(w http.ResponseWriter, r *http.Request) {
 		return expired[i].EndsAt.After(expired[j].EndsAt)
 	})
 
+	// Initialize silences explicitly to an empty list (instead of nil)
+	// So that it does not get converted to "null" in JSON.
+	silences := []*types.Silence{}
 	silences = append(silences, active...)
 	silences = append(silences, pending...)
 	silences = append(silences, expired...)
@@ -646,14 +647,27 @@ func (api *API) listSilences(w http.ResponseWriter, r *http.Request) {
 	api.respond(w, silences)
 }
 
-func matchesFilterLabels(s *types.Silence, matchers []*labels.Matcher) bool {
-	sms := map[string]string{}
+func silenceMatchesFilterLabels(s *types.Silence, matchers []*labels.Matcher) bool {
+	sms := make(map[string]string)
 	for _, m := range s.Matchers {
 		sms[m.Name] = m.Value
 	}
+
+	return matchFilterLabels(matchers, sms)
+}
+
+func matchFilterLabels(matchers []*labels.Matcher, sms map[string]string) bool {
 	for _, m := range matchers {
-		if v, prs := sms[m.Name]; !prs || !m.Matches(v) {
-			return false
+		v, prs := sms[m.Name]
+		switch m.Type {
+		case labels.MatchNotEqual, labels.MatchNotRegexp:
+			if !m.Matches(string(v)) {
+				return false
+			}
+		default:
+			if !prs || !m.Matches(string(v)) {
+				return false
+			}
 		}
 	}
 

@@ -236,7 +236,7 @@ func createStage(rc *config.Receiver, tmpl *template.Template, wait func() time.
 		}
 		var s MultiStage
 		s = append(s, NewWaitStage(wait))
-		s = append(s, NewDedupStage(notificationLog, recv, i.conf.SendResolved()))
+		s = append(s, NewDedupStage(notificationLog, recv))
 		s = append(s, NewRetryStage(i))
 		s = append(s, NewSetNotifiesStage(notificationLog, recv))
 
@@ -362,7 +362,7 @@ func (n *SilenceStage) Exec(ctx context.Context, l log.Logger, alerts ...*types.
 		// TODO(fabxc): increment total alerts counter.
 		// Do not send the alert if the silencer mutes it.
 		sils, err := n.silences.Query(
-			silence.QState(silence.StateActive),
+			silence.QState(types.SilenceStateActive),
 			silence.QMatches(a.Labels),
 		)
 		if err != nil {
@@ -411,22 +411,20 @@ func (ws *WaitStage) Exec(ctx context.Context, l log.Logger, alerts ...*types.Al
 // DedupStage filters alerts.
 // Filtering happens based on a notification log.
 type DedupStage struct {
-	nflog        nflog.Log
-	recv         *nflogpb.Receiver
-	sendResolved bool
+	nflog nflog.Log
+	recv  *nflogpb.Receiver
 
 	now  func() time.Time
 	hash func(*types.Alert) uint64
 }
 
 // NewDedupStage wraps a DedupStage that runs against the given notification log.
-func NewDedupStage(l nflog.Log, recv *nflogpb.Receiver, sendResolved bool) *DedupStage {
+func NewDedupStage(l nflog.Log, recv *nflogpb.Receiver) *DedupStage {
 	return &DedupStage{
-		nflog:        l,
-		recv:         recv,
-		now:          utcNow,
-		sendResolved: sendResolved,
-		hash:         hashAlert,
+		nflog: l,
+		recv:  recv,
+		now:   utcNow,
+		hash:  hashAlert,
 	}
 }
 
@@ -474,15 +472,6 @@ func hashAlert(a *types.Alert) uint64 {
 	return hash
 }
 
-func allAlertsResolved(alerts []*types.Alert) bool {
-	for _, a := range alerts {
-		if !a.Resolved() {
-			return false
-		}
-	}
-	return true
-}
-
 func (n *DedupStage) needsUpdate(entry *nflogpb.Entry, firing, resolved map[uint64]struct{}, repeat time.Duration) (bool, error) {
 	// If we haven't notified about the alert group before, notify right away
 	// unless we only have resolved alerts.
@@ -494,7 +483,7 @@ func (n *DedupStage) needsUpdate(entry *nflogpb.Entry, firing, resolved map[uint
 		return true, nil
 	}
 
-	if n.sendResolved && !entry.IsResolvedSubset(resolved) {
+	if !entry.IsResolvedSubset(resolved) {
 		return true, nil
 	}
 
@@ -545,7 +534,7 @@ func (n *DedupStage) Exec(ctx context.Context, l log.Logger, alerts ...*types.Al
 	case 1:
 		entry = entries[0]
 	case 2:
-		return ctx, nil, fmt.Errorf("Unexpected entry result size %d", len(entries))
+		return ctx, nil, fmt.Errorf("unexpected entry result size %d", len(entries))
 	}
 	if ok, err := n.needsUpdate(entry, firingSet, resolvedSet, repeatInterval); err != nil {
 		return ctx, nil, err
@@ -570,6 +559,19 @@ func NewRetryStage(i Integration) *RetryStage {
 
 // Exec implements the Stage interface.
 func (r RetryStage) Exec(ctx context.Context, l log.Logger, alerts ...*types.Alert) (context.Context, []*types.Alert, error) {
+	// If we shouldn't send notifications for resolved alerts, but there are only
+	// resolved alerts, report them all as successfully notified (we still want the
+	// notification log to log them).
+	if !r.integration.conf.SendResolved() {
+		firing, ok := FiringAlerts(ctx)
+		if !ok {
+			return ctx, alerts, fmt.Errorf("firing alerts missing")
+		}
+		if len(firing) == 0 {
+			return ctx, alerts, nil
+		}
+	}
+
 	var (
 		i    = 0
 		b    = backoff.NewExponentialBackOff()
@@ -597,7 +599,7 @@ func (r RetryStage) Exec(ctx context.Context, l log.Logger, alerts ...*types.Ale
 				numFailedNotifications.WithLabelValues(r.integration.name).Inc()
 				level.Debug(l).Log("msg", "Notify attempt failed", "attempt", i, "integration", r.integration.name, "err", err)
 				if !retry {
-					return ctx, alerts, fmt.Errorf("Cancelling notify retry for %q due to unrecoverable error: %s", r.integration.name, err)
+					return ctx, alerts, fmt.Errorf("cancelling notify retry for %q due to unrecoverable error: %s", r.integration.name, err)
 				}
 
 				// Save this error to be able to return the last seen error by an

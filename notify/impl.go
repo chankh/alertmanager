@@ -20,7 +20,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"mime"
 	"mime/multipart"
 	"net"
@@ -442,18 +441,107 @@ const (
 )
 
 type pagerDutyMessage struct {
-	ServiceKey  string            `json:"service_key"`
-	IncidentKey string            `json:"incident_key"`
-	EventType   string            `json:"event_type"`
-	Description string            `json:"description"`
+	RoutingKey  string            `json:"routing_key,omitempty"`
+	ServiceKey  string            `json:"service_key,omitempty"`
+	DedupKey    string            `json:"dedup_key,omitempty"`
+	IncidentKey string            `json:"incident_key,omitempty"`
+	EventType   string            `json:"event_type,omitempty"`
+	Description string            `json:"description,omitempty"`
+	EventAction string            `json:"event_action"`
+	Payload     *pagerDutyPayload `json:"payload"`
 	Client      string            `json:"client,omitempty"`
 	ClientURL   string            `json:"client_url,omitempty"`
 	Details     map[string]string `json:"details,omitempty"`
 }
 
+type pagerDutyPayload struct {
+	Summary       string            `json:"summary"`
+	Source        string            `json:"source"`
+	Severity      string            `json:"severity"`
+	Timestamp     string            `json:"timestamp,omitempty"`
+	Component     string            `json:"component,omitempty"`
+	Group         string            `json:"group,omitempty"`
+	CustomDetails map[string]string `json:"custom_details,omitempty"`
+}
+
+func (n *PagerDuty) notifyV1(ctx context.Context, eventType, key string, tmpl func(string) string, details map[string]string, as ...*types.Alert) (bool, error) {
+	level.Info(n.logger).Log("msg", "PagerDuty v1 API will no longer be supported: https://v2.developer.pagerduty.com/v2/docs/api-v2-frequently-asked-questions")
+
+	msg := &pagerDutyMessage{
+		ServiceKey:  string(n.conf.ServiceKey),
+		EventType:   eventType,
+		IncidentKey: hashKey(key),
+		Description: tmpl(n.conf.Description),
+		Details:     details,
+	}
+
+	n.conf.URL = "https://events.pagerduty.com/generic/2010-04-15/create_event.json"
+
+	if eventType == pagerDutyEventTrigger {
+		msg.Client = tmpl(n.conf.Client)
+		msg.ClientURL = tmpl(n.conf.ClientURL)
+	}
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(msg); err != nil {
+		return false, err
+	}
+
+	resp, err := ctxhttp.Post(ctx, http.DefaultClient, n.conf.URL, contentTypeJSON, &buf)
+	if err != nil {
+		return true, err
+	}
+	defer resp.Body.Close()
+
+	return n.retryV1(resp.StatusCode)
+}
+
+func (n *PagerDuty) notifyV2(ctx context.Context, eventType, key string, tmpl func(string) string, details map[string]string, as ...*types.Alert) (bool, error) {
+	if n.conf.Severity == "" {
+		n.conf.Severity = "error"
+	}
+
+	var payload *pagerDutyPayload
+	if eventType == pagerDutyEventTrigger {
+		payload = &pagerDutyPayload{
+			Summary:       tmpl(n.conf.Description),
+			Source:        n.conf.Client,
+			Severity:      n.conf.Severity,
+			CustomDetails: details,
+			Component:     n.conf.Component,
+			Group:         n.conf.Group,
+		}
+	}
+
+	msg := &pagerDutyMessage{
+		RoutingKey:  string(n.conf.RoutingKey),
+		EventAction: eventType,
+		DedupKey:    hashKey(key),
+		Payload:     payload,
+	}
+
+	if eventType == pagerDutyEventTrigger {
+		msg.Client = tmpl(n.conf.Client)
+		msg.ClientURL = tmpl(n.conf.ClientURL)
+	}
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(msg); err != nil {
+		return false, err
+	}
+
+	resp, err := ctxhttp.Post(ctx, http.DefaultClient, n.conf.URL, contentTypeJSON, &buf)
+	if err != nil {
+		return true, err
+	}
+	defer resp.Body.Close()
+
+	return n.retryV2(resp.StatusCode)
+}
+
 // Notify implements the Notifier interface.
 //
-// http://developer.pagerduty.com/documentation/integration/events/trigger
+// https://v2.developer.pagerduty.com/docs/events-api-v2
 func (n *PagerDuty) Notify(ctx context.Context, as ...*types.Alert) (bool, error) {
 	key, ok := GroupKey(ctx)
 	if !ok {
@@ -478,41 +566,33 @@ func (n *PagerDuty) Notify(ctx context.Context, as ...*types.Alert) (bool, error
 		details[k] = tmpl(v)
 	}
 
-	msg := &pagerDutyMessage{
-		ServiceKey:  tmpl(string(n.conf.ServiceKey)),
-		EventType:   eventType,
-		IncidentKey: hashKey(key),
-		Description: tmpl(n.conf.Description),
-		Details:     details,
-	}
-	if eventType == pagerDutyEventTrigger {
-		msg.Client = tmpl(n.conf.Client)
-		msg.ClientURL = tmpl(n.conf.ClientURL)
-	}
 	if err != nil {
 		return false, err
 	}
 
-	var buf bytes.Buffer
-	if err := json.NewEncoder(&buf).Encode(msg); err != nil {
-		return false, err
+	if n.conf.ServiceKey != "" {
+		return n.notifyV1(ctx, eventType, key, tmpl, details, as...)
 	}
-
-	resp, err := ctxhttp.Post(ctx, http.DefaultClient, n.conf.URL, contentTypeJSON, &buf)
-	if err != nil {
-		return true, err
-	}
-	resp.Body.Close()
-
-	return n.retry(resp.StatusCode)
+	return n.notifyV2(ctx, eventType, key, tmpl, details, as...)
 }
 
-func (n *PagerDuty) retry(statusCode int) (bool, error) {
+func (n *PagerDuty) retryV1(statusCode int) (bool, error) {
 	// Retrying can solve the issue on 403 (rate limiting) and 5xx response codes.
 	// 2xx response codes indicate a successful request.
 	// https://v2.developer.pagerduty.com/docs/trigger-events
 	if statusCode/100 != 2 {
 		return (statusCode == 403 || statusCode/100 == 5), fmt.Errorf("unexpected status code %v", statusCode)
+	}
+
+	return false, nil
+}
+
+func (n *PagerDuty) retryV2(statusCode int) (bool, error) {
+	// Retrying can solve the issue on 429 (rate limiting) and 5xx response codes.
+	// 2xx response codes indicate a successful request.
+	// https://v2.developer.pagerduty.com/docs/events-api-v2#api-response-codes--retry-logic
+	if statusCode/100 != 2 {
+		return (statusCode == 429 || statusCode/100 == 5), fmt.Errorf("unexpected status code %v", statusCode)
 	}
 
 	return false, nil
@@ -707,30 +787,20 @@ func NewOpsGenie(c *config.OpsGenieConfig, t *template.Template, l log.Logger) *
 	return &OpsGenie{conf: c, tmpl: t, logger: l}
 }
 
-type opsGenieMessage struct {
-	APIKey string `json:"apiKey"`
-	Alias  string `json:"alias"`
-}
-
 type opsGenieCreateMessage struct {
-	*opsGenieMessage `json:",inline"`
-
-	Message     string            `json:"message"`
-	Description string            `json:"description,omitempty"`
-	Details     map[string]string `json:"details"`
-	Source      string            `json:"source"`
-	Teams       string            `json:"teams,omitempty"`
-	Tags        string            `json:"tags,omitempty"`
-	Note        string            `json:"note,omitempty"`
+	Alias       string              `json:"alias"`
+	Message     string              `json:"message"`
+	Description string              `json:"description,omitempty"`
+	Details     map[string]string   `json:"details"`
+	Source      string              `json:"source"`
+	Teams       []map[string]string `json:"teams,omitempty"`
+	Tags        []string            `json:"tags,omitempty"`
+	Note        string              `json:"note,omitempty"`
+	Priority    string              `json:"priority,omitempty"`
 }
 
 type opsGenieCloseMessage struct {
-	*opsGenieMessage `json:",inline"`
-}
-
-type opsGenieErrorResponse struct {
-	Code  int    `json:"code"`
-	Error string `json:"error"`
+	Source string `json:"source"`
 }
 
 // Notify implements the Notifier interface.
@@ -754,17 +824,13 @@ func (n *OpsGenie) Notify(ctx context.Context, as ...*types.Alert) (bool, error)
 	var (
 		msg    interface{}
 		apiURL string
-
-		apiMsg = opsGenieMessage{
-			APIKey: string(n.conf.APIKey),
-			Alias:  hashKey(key),
-		}
+		alias  = hashKey(key)
 		alerts = types.Alerts(as...)
 	)
 	switch alerts.Status() {
 	case model.AlertResolved:
-		apiURL = n.conf.APIHost + "v1/json/alert/close"
-		msg = &opsGenieCloseMessage{&apiMsg}
+		apiURL = fmt.Sprintf("%sv2/alerts/%s/close?identifierType=alias", n.conf.APIURL, alias)
+		msg = &opsGenieCloseMessage{Source: tmpl(n.conf.Source)}
 	default:
 		message := tmpl(n.conf.Message)
 		if len(message) > 130 {
@@ -772,16 +838,21 @@ func (n *OpsGenie) Notify(ctx context.Context, as ...*types.Alert) (bool, error)
 			level.Debug(n.logger).Log("msg", "Truncated message to %q due to OpsGenie message limit", "truncated_message", message, "incident", key)
 		}
 
-		apiURL = n.conf.APIHost + "v1/json/alert"
+		apiURL = n.conf.APIURL + "v2/alerts"
+		var teams []map[string]string
+		for _, t := range strings.Split(string(tmpl(n.conf.Teams)), ",") {
+			teams = append(teams, map[string]string{"name": t})
+		}
 		msg = &opsGenieCreateMessage{
-			opsGenieMessage: &apiMsg,
-			Message:         message,
-			Description:     tmpl(n.conf.Description),
-			Details:         details,
-			Source:          tmpl(n.conf.Source),
-			Teams:           tmpl(n.conf.Teams),
-			Tags:            tmpl(n.conf.Tags),
-			Note:            tmpl(n.conf.Note),
+			Alias:       alias,
+			Message:     message,
+			Description: tmpl(n.conf.Description),
+			Details:     details,
+			Source:      tmpl(n.conf.Source),
+			Teams:       teams,
+			Tags:        strings.Split(string(tmpl(n.conf.Tags)), ","),
+			Note:        tmpl(n.conf.Note),
+			Priority:    tmpl(n.conf.Priority),
 		}
 	}
 	if err != nil {
@@ -793,43 +864,32 @@ func (n *OpsGenie) Notify(ctx context.Context, as ...*types.Alert) (bool, error)
 		return false, err
 	}
 
-	resp, err := ctxhttp.Post(ctx, http.DefaultClient, apiURL, contentTypeJSON, &buf)
+	req, err := http.NewRequest("POST", apiURL, &buf)
+	if err != nil {
+		return true, err
+	}
+	req.Header.Set("Content-Type", contentTypeJSON)
+	req.Header.Set("Authorization", fmt.Sprintf("GenieKey %s", n.conf.APIKey))
+
+	resp, err := ctxhttp.Do(ctx, http.DefaultClient, req)
+
 	if err != nil {
 		return true, err
 	}
 	defer resp.Body.Close()
 
-	// Missing documentation therefore assuming only 5xx response codes are
-	// recoverable.
-	if resp.StatusCode/100 == 5 {
-		return true, fmt.Errorf("unexpected status code %v", resp.StatusCode)
-	} else if resp.StatusCode == 400 && alerts.Status() == model.AlertResolved {
-		body, _ := ioutil.ReadAll(resp.Body)
+	return n.retry(resp.StatusCode)
+}
 
-		var responseMessage opsGenieErrorResponse
-		if err := json.Unmarshal(body, &responseMessage); err != nil {
-			return false, fmt.Errorf("could not parse error response %q", body)
-		}
-		const alreadyClosedError = 5
-		if responseMessage.Code == alreadyClosedError {
-			return false, nil
-		}
-		return false, fmt.Errorf("error when closing alert: code %d, error %q",
-			responseMessage.Code, responseMessage.Error)
-	} else if resp.StatusCode/100 == 4 {
-		return false, fmt.Errorf("unexpected status code %v", resp.StatusCode)
-	} else if resp.StatusCode/100 != 2 {
-		body, _ := ioutil.ReadAll(resp.Body)
-		level.Debug(n.logger).Log(
-			"msg", "Unexpected OpsGenie response",
-			"incident", key,
-			"url", apiURL,
-			"posted_message", msg,
-			"status", resp.Status,
-			"response_body", body,
-		)
-		return false, fmt.Errorf("unexpected status code %v", resp.StatusCode)
+func (n *OpsGenie) retry(statusCode int) (bool, error) {
+	// https://docs.opsgenie.com/docs/response#section-response-codes
+	// Response codes 429 (rate limiting) and 5xx are potentially recoverable
+	if statusCode/100 == 5 || statusCode == 429 {
+		return true, fmt.Errorf("unexpected status code %v", statusCode)
+	} else if statusCode/100 != 2 {
+		return false, fmt.Errorf("unexpected status code %v", statusCode)
 	}
+
 	return false, nil
 }
 
@@ -885,7 +945,7 @@ func (n *VictorOps) Notify(ctx context.Context, as ...*types.Alert) (bool, error
 		alerts       = types.Alerts(as...)
 		data         = n.tmpl.Data(receiverName(ctx, n.logger), groupLabels(ctx, n.logger), as...)
 		tmpl         = tmplText(n.tmpl, data, &err)
-		apiURL       = fmt.Sprintf("%s%s/%s", n.conf.APIURL, n.conf.APIKey, n.conf.RoutingKey)
+		apiURL       = fmt.Sprintf("%s%s/%s", n.conf.APIURL, n.conf.APIKey, tmpl(n.conf.RoutingKey))
 		messageType  = tmpl(n.conf.MessageType)
 		stateMessage = tmpl(n.conf.StateMessage)
 	)
@@ -927,31 +987,16 @@ func (n *VictorOps) Notify(ctx context.Context, as ...*types.Alert) (bool, error
 
 	defer resp.Body.Close()
 
+	return n.retry(resp.StatusCode)
+}
+
+func (n *VictorOps) retry(statusCode int) (bool, error) {
 	// Missing documentation therefore assuming only 5xx response codes are
 	// recoverable.
-	if resp.StatusCode/100 == 5 {
-		return true, fmt.Errorf("unexpected status code %v", resp.StatusCode)
-	}
-
-	if resp.StatusCode/100 != 2 {
-		body, _ := ioutil.ReadAll(resp.Body)
-
-		var responseMessage victorOpsErrorResponse
-		if err := json.Unmarshal(body, &responseMessage); err != nil {
-			return false, fmt.Errorf("could not parse error response %q", body)
-		}
-
-		level.Debug(n.logger).Log(
-			"msg", "Unexpected VictorOps response",
-			"incident", key,
-			"url", apiURL,
-			"posted_message", msg,
-			"status", resp.Status,
-			"response_body", body,
-		)
-
-		return false, fmt.Errorf("error when posting alert: result %q, message %q",
-			responseMessage.Result, responseMessage.Message)
+	if statusCode/100 == 5 {
+		return true, fmt.Errorf("unexpected status code %v", statusCode)
+	} else if statusCode/100 != 2 {
+		return false, fmt.Errorf("unexpected status code %v", statusCode)
 	}
 
 	return false, nil
@@ -1005,12 +1050,12 @@ func (n *Pushover) Notify(ctx context.Context, as ...*types.Alert) (bool, error)
 	}
 	parameters.Add("message", message)
 
-	supplementaryUrl := tmpl(n.conf.URL)
-	if len(supplementaryUrl) > 512 {
-		supplementaryUrl = supplementaryUrl[:509] + "..."
-		level.Debug(n.logger).Log("msg", "Truncated URL due to Pushover url limit", "truncated_url", supplementaryUrl, "incident", key)
+	supplementaryURL := tmpl(n.conf.URL)
+	if len(supplementaryURL) > 512 {
+		supplementaryURL = supplementaryURL[:509] + "..."
+		level.Debug(n.logger).Log("msg", "Truncated URL due to Pushover url limit", "truncated_url", supplementaryURL, "incident", key)
 	}
-	parameters.Add("url", supplementaryUrl)
+	parameters.Add("url", supplementaryURL)
 
 	parameters.Add("priority", tmpl(n.conf.Priority))
 	parameters.Add("retry", fmt.Sprintf("%d", int64(time.Duration(n.conf.Retry).Seconds())))
@@ -1033,19 +1078,17 @@ func (n *Pushover) Notify(ctx context.Context, as ...*types.Alert) (bool, error)
 	}
 	defer resp.Body.Close()
 
+	return n.retry(resp.StatusCode)
+}
+
+func (n *Pushover) retry(statusCode int) (bool, error) {
 	// Only documented behaviour is that 2xx response codes are successful and
 	// 4xx are unsuccessful, therefore assuming only 5xx are recoverable.
 	// https://pushover.net/api#response
-	if resp.StatusCode/100 == 5 {
-		return true, fmt.Errorf("unexpected status code %v", resp.StatusCode)
-	}
-
-	if resp.StatusCode/100 != 2 {
-		body, err := ioutil.ReadAll(resp.Body)
-		if err != nil {
-			return false, err
-		}
-		return false, fmt.Errorf("unexpected status code %v (body: %s)", resp.StatusCode, string(body))
+	if statusCode/100 == 5 {
+		return true, fmt.Errorf("unexpected status code %v", statusCode)
+	} else if statusCode/100 != 2 {
+		return false, fmt.Errorf("unexpected status code %v", statusCode)
 	}
 
 	return false, nil
