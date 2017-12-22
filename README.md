@@ -1,6 +1,6 @@
-# Alertmanager [![Build Status](https://travis-ci.org/chankh/alertmanager.svg?branch=maaii)][travis]
+# Alertmanager [![Build Status](https://travis-ci.org/chankh/alertmanager.svg?branch=maaii)](https://travis-ci.org/chankh/alertmanager)
 
-[![CircleCI](https://circleci.com/gh/chankh/alertmanager/tree/maaii.svg?style=shield)][circleci]
+[![CircleCI](https://circleci.com/gh/chankh/alertmanager/tree/maaii.svg?style=shield)](https://circleci.com/gh/chankh/alertmanager/tree/maaii)
 [![Docker Repository on Quay](https://quay.io/repository/prometheus/alertmanager/status)][quay]
 [![Docker Pulls](https://img.shields.io/docker/pulls/prom/alertmanager.svg?maxAge=604800)][hub]
 
