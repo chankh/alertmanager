@@ -15,6 +15,7 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"regexp"
@@ -30,6 +31,7 @@ import (
 	"github.com/prometheus/common/version"
 	"github.com/prometheus/prometheus/pkg/labels"
 
+	"github.com/prometheus/alertmanager/cluster"
 	"github.com/prometheus/alertmanager/config"
 	"github.com/prometheus/alertmanager/dispatch"
 	"github.com/prometheus/alertmanager/pkg/parse"
@@ -37,7 +39,6 @@ import (
 	"github.com/prometheus/alertmanager/silence"
 	"github.com/prometheus/alertmanager/silence/silencepb"
 	"github.com/prometheus/alertmanager/types"
-	"github.com/weaveworks/mesh"
 )
 
 var (
@@ -81,7 +82,7 @@ type API struct {
 	route          *dispatch.Route
 	resolveTimeout time.Duration
 	uptime         time.Time
-	mrouter        *mesh.Router
+	peer           *cluster.Peer
 	logger         log.Logger
 
 	groups         groupsFn
@@ -94,14 +95,25 @@ type groupsFn func([]*labels.Matcher) dispatch.AlertOverview
 type getAlertStatusFn func(model.Fingerprint) types.AlertStatus
 
 // New returns a new API.
-func New(alerts provider.Alerts, silences *silence.Silences, gf groupsFn, sf getAlertStatusFn, router *mesh.Router, l log.Logger) *API {
+func New(
+	alerts provider.Alerts,
+	silences *silence.Silences,
+	gf groupsFn,
+	sf getAlertStatusFn,
+	peer *cluster.Peer,
+	l log.Logger,
+) *API {
+	if l == nil {
+		l = log.NewNopLogger()
+	}
+
 	return &API{
 		alerts:         alerts,
 		silences:       silences,
 		groups:         gf,
 		getAlertStatus: sf,
 		uptime:         time.Now(),
-		mrouter:        router,
+		peer:           peer,
 		logger:         l,
 	}
 }
@@ -181,11 +193,11 @@ func (api *API) status(w http.ResponseWriter, req *http.Request) {
 	api.mtx.RLock()
 
 	var status = struct {
-		ConfigYAML  string            `json:"configYAML"`
-		ConfigJSON  *config.Config    `json:"configJSON"`
-		VersionInfo map[string]string `json:"versionInfo"`
-		Uptime      time.Time         `json:"uptime"`
-		MeshStatus  *meshStatus       `json:"meshStatus"`
+		ConfigYAML    string            `json:"configYAML"`
+		ConfigJSON    *config.Config    `json:"configJSON"`
+		VersionInfo   map[string]string `json:"versionInfo"`
+		Uptime        time.Time         `json:"uptime"`
+		ClusterStatus *clusterStatus    `json:"clusterStatus"`
 	}{
 		ConfigYAML: api.config.String(),
 		ConfigJSON: api.config,
@@ -197,8 +209,8 @@ func (api *API) status(w http.ResponseWriter, req *http.Request) {
 			"buildDate": version.BuildDate,
 			"goVersion": version.GoVersion,
 		},
-		Uptime:     api.uptime,
-		MeshStatus: getMeshStatus(api),
+		Uptime:        api.uptime,
+		ClusterStatus: getClusterStatus(api.peer),
 	}
 
 	api.mtx.RUnlock()
@@ -206,39 +218,29 @@ func (api *API) status(w http.ResponseWriter, req *http.Request) {
 	api.respond(w, status)
 }
 
-type meshStatus struct {
-	Name     string       `json:"name"`
-	NickName string       `json:"nickName"`
-	Peers    []peerStatus `json:"peers"`
-}
-
 type peerStatus struct {
-	Name     string `json:"name"`     // e.g. "00:00:00:00:00:01"
-	NickName string `json:"nickName"` // e.g. "a"
-	UID      uint64 `json:"uid"`      // e.g. "14015114173033265000"
+	Name    string `json:"name"`
+	Address string `json:"address"`
 }
 
-func getMeshStatus(api *API) *meshStatus {
-	if api.mrouter == nil {
+type clusterStatus struct {
+	Name  string       `json:"name"`
+	Peers []peerStatus `json:"peers"`
+}
+
+func getClusterStatus(p *cluster.Peer) *clusterStatus {
+	if p == nil {
 		return nil
 	}
+	s := &clusterStatus{Name: p.Name()}
 
-	status := mesh.NewStatus(api.mrouter)
-	strippedStatus := &meshStatus{
-		Name:     status.Name,
-		NickName: status.NickName,
-		Peers:    make([]peerStatus, len(status.Peers)),
+	for _, n := range p.Peers() {
+		s.Peers = append(s.Peers, peerStatus{
+			Name:    n.Name,
+			Address: n.Address(),
+		})
 	}
-
-	for i := 0; i < len(status.Peers); i++ {
-		strippedStatus.Peers[i] = peerStatus{
-			Name:     status.Peers[i].Name,
-			NickName: status.Peers[i].NickName,
-			UID:      uint64(status.Peers[i].UID),
-		}
-	}
-
-	return strippedStatus
+	return s
 }
 
 func (api *API) alertGroups(w http.ResponseWriter, r *http.Request) {
@@ -468,14 +470,19 @@ func (api *API) insertAlerts(w http.ResponseWriter, r *http.Request, alerts ...*
 
 		// Ensure StartsAt is set.
 		if alert.StartsAt.IsZero() {
-			alert.StartsAt = now
+			if alert.EndsAt.IsZero() {
+				alert.StartsAt = now
+			} else {
+				alert.StartsAt = alert.EndsAt
+			}
 		}
 		// If no end time is defined, set a timeout after which an alert
 		// is marked resolved if it is not updated.
 		if alert.EndsAt.IsZero() {
 			alert.Timeout = true
 			alert.EndsAt = now.Add(resolveTimeout)
-
+		}
+		if alert.EndsAt.After(time.Now()) {
 			numReceivedAlerts.WithLabelValues("firing").Inc()
 		} else {
 			numReceivedAlerts.WithLabelValues("resolved").Inc()
@@ -523,6 +530,27 @@ func (api *API) setSilence(w http.ResponseWriter, r *http.Request) {
 		}, nil)
 		return
 	}
+
+	// This is an API only validation, it cannot be done internally
+	// because the expired silence is semantically important.
+	// But one should not be able to create expired silences, that
+	// won't have any use.
+	if sil.Expired() {
+		api.respondError(w, apiError{
+			typ: errorBadData,
+			err: errors.New("start time must not be equal to end time"),
+		}, nil)
+		return
+	}
+
+	if sil.EndsAt.Before(time.Now()) {
+		api.respondError(w, apiError{
+			typ: errorBadData,
+			err: errors.New("end time can't be in the past"),
+		}, nil)
+		return
+	}
+
 	psil, err := silenceToProto(&sil)
 	if err != nil {
 		api.respondError(w, apiError{
@@ -771,7 +799,7 @@ func (api *API) respondError(w http.ResponseWriter, apiErr apiError, data interf
 	case errorInternal:
 		w.WriteHeader(http.StatusInternalServerError)
 	default:
-		panic(fmt.Sprintf("unknown error type %q", apiErr))
+		panic(fmt.Sprintf("unknown error type %q", apiErr.Error()))
 	}
 
 	b, err := json.Marshal(&response{

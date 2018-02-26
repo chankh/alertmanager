@@ -36,7 +36,7 @@ route:
   group_by: []
   group_wait:      1s
   group_interval:  1s
-  repeat_interval: 0s
+  repeat_interval: 1ms
 
 receivers:
 - name: "default"
@@ -112,7 +112,7 @@ route:
   group_by: []
   group_wait:      1s
   group_interval:  1s
-  repeat_interval: 0s
+  repeat_interval: 1ms
 
 receivers:
 - name: "default"
@@ -215,7 +215,8 @@ route:
   group_by: []
   group_wait:      1s
   group_interval:  1s
-  repeat_interval: 5s
+  # use a value slightly below the 5s interval to avoid timing issues
+  repeat_interval: 4900ms
 
 receivers:
 - name: "default"
@@ -386,10 +387,8 @@ receivers:
 		Alert("alertname", "test", "lbl", "v2").Active(1),
 		Alert("alertname", "test", "lbl", "v3").Active(3),
 	)
-	co1.Want(Between(12, 12.5),
-		Alert("alertname", "test", "lbl", "v2").Active(1, 11),
-		Alert("alertname", "test", "lbl", "v3").Active(3),
-	)
+	// no notification should be sent after group_interval because no new alert has been fired
+	co1.Want(Between(12, 12.5))
 
 	co2.Want(Between(2, 2.5),
 		Alert("alertname", "test", "lbl", "v1").Active(1),
@@ -399,9 +398,7 @@ receivers:
 		Alert("alertname", "test", "lbl", "v2").Active(1),
 		Alert("alertname", "test", "lbl", "v3").Active(3),
 	)
-	co2.Want(Between(12, 12.5),
-		Alert("alertname", "test", "lbl", "v3").Active(3),
-	)
+	co1.Want(Between(12, 12.5))
 
 	at.Run()
 }

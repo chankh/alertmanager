@@ -1,8 +1,10 @@
 package config
 
 import (
-	"gopkg.in/yaml.v2"
+	"strings"
 	"testing"
+
+	"gopkg.in/yaml.v2"
 )
 
 func TestEmailToIsPresent(t *testing.T) {
@@ -110,6 +112,62 @@ url: ''
 	}
 }
 
+func TestWebhookHttpConfigIsValid(t *testing.T) {
+	in := `
+url: 'http://example.com'
+http_config:
+  bearer_token: foo
+  bearer_token_file: /tmp/bar
+`
+	var cfg WebhookConfig
+	err := yaml.Unmarshal([]byte(in), &cfg)
+
+	expected := "at most one of bearer_token & bearer_token_file must be configured"
+
+	if err == nil {
+		t.Fatalf("no error returned, expected:\n%v", expected)
+	}
+	if err.Error() != expected {
+		t.Errorf("\nexpected:\n%v\ngot:\n%v", expected, err.Error())
+	}
+}
+
+func TestWebhookHttpConfigIsOptional(t *testing.T) {
+	in := `
+url: 'http://example.com'
+`
+	var cfg WebhookConfig
+	err := yaml.Unmarshal([]byte(in), &cfg)
+
+	if err != nil {
+		t.Fatalf("no error expected, returned:\n%v", err.Error())
+	}
+}
+
+func TestWebhookPasswordIsObsfucated(t *testing.T) {
+	in := `
+url: 'http://example.com'
+http_config:
+  basic_auth:
+    username: foo
+    password: supersecret
+`
+	var cfg WebhookConfig
+	err := yaml.Unmarshal([]byte(in), &cfg)
+
+	if err != nil {
+		t.Fatalf("no error expected, returned:\n%v", err.Error())
+	}
+
+	ycfg, err := yaml.Marshal(cfg)
+	if err != nil {
+		t.Fatalf("no error expected, returned:\n%v", err.Error())
+	}
+	if strings.Contains(string(ycfg), "supersecret") {
+		t.Errorf("Found password in the YAML cfg: %s\n", ycfg)
+	}
+}
+
 func TestWechatAPIKeyIsPresent(t *testing.T) {
 	in := `
 api_secret: ''
@@ -128,29 +186,13 @@ api_secret: ''
 }
 func TestWechatCorpIDIsPresent(t *testing.T) {
 	in := `
+api_secret: 'api_secret'
 corp_id: ''
 `
 	var cfg WechatConfig
 	err := yaml.Unmarshal([]byte(in), &cfg)
 
 	expected := "missing Wechat CorpID in Wechat config"
-
-	if err == nil {
-		t.Fatalf("no error returned, expected:\n%v", expected)
-	}
-	if err.Error() != expected {
-		t.Errorf("\nexpected:\n%v\ngot:\n%v", expected, err.Error())
-	}
-}
-
-func TestOpsGenieAPIKeyIsPresent(t *testing.T) {
-	in := `
-api_key: ''
-`
-	var cfg OpsGenieConfig
-	err := yaml.Unmarshal([]byte(in), &cfg)
-
-	expected := "missing API key in OpsGenie config"
 
 	if err == nil {
 		t.Fatalf("no error returned, expected:\n%v", expected)

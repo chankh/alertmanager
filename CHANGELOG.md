@@ -1,3 +1,36 @@
+## 0.14.0 / 2018-02-12
+
+* [ENHANCEMENT] [amtool] Silence update support dwy suffixes to expire flag (#1197)
+* [ENHANCEMENT] Allow templating PagerDuty receiver severity (#1214)
+* [ENHANCEMENT] Include receiver name in failed notifications log messages (#1207)
+* [ENHANCEMENT] Allow global opsgenie api key (#1208)
+* [ENHANCEMENT] Add mesh metrics (#1225)
+* [ENHANCEMENT] Add Class field to PagerDuty; add templating to PagerDuty-CEF fields (#1231)
+* [BUGFIX] Don't notify of resolved alerts if none were reported firing (#1198)
+* [BUGFIX] Notify only when new firing alerts are added (#1205)
+* [BUGFIX] [mesh] Fix pending connections never set to established (#1204)
+* [BUGFIX] Allow OpsGenie notifier to have empty team fields (#1224)
+* [BUGFIX] Don't count alerts with EndTime in the future as resolved (#1233)
+* [BUGFIX] Speed up re-rendering of Silence UI (#1235)
+* [BUGFIX] Forbid 0 value for group_interval and repeat_interval (#1230)
+* [BUGFIX] Fix WeChat agentid issue (#1229)
+
+## 0.13.0 / 2018-01-12
+
+* [CHANGE] Switch cmd/alertmanager to kingpin (#974)
+* [CHANGE] [amtool] Switch amtool to kingpin (#976)
+* [CHANGE] [amtool] silence query: --expired flag only shows expired silences (#1190)
+* [CHANGE] Return config reload result from reload endpoint (#1180)
+* [FEATURE] UI silence form is populated from location bar (#1148)
+* [FEATURE] Add /-/healthy endpoint (#1159)
+* [ENHANCEMENT] Instrument and log snapshot sizes on maintenance (#1155)
+* [ENHANCEMENT] Make alertGC interval configurable (#1151)
+* [ENHANCEMENT] Display mesh connections in the Status page (#1164)
+* [BUGFIX] Template service keys for pagerduty notifier (#1182)
+* [BUGFIX] Fix expire buttons on the silences page (#1171)
+* [BUGFIX] Fix JavaScript error in MSIE due to endswith() usage (#1172)
+* [BUGFIX] Correctly format UI error output (#1167)
+
 ## 0.12.0 / 2017-12-15
 
 * [FEATURE] package amtool in docker container (#1127)
