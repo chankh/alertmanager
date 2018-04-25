@@ -480,5 +480,5 @@ func (c *MaaiiConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	if c.DeveloperSecret == "" {
 		return fmt.Errorf("missing developer secret in the Maaii config")
 	}
-	return checkOverflow(c.XXX, "maaii config")
+	return nil
 }

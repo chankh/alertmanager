@@ -1396,9 +1396,6 @@ func (n *Maaii) Notify(ctx context.Context, as ...*types.Alert) (bool, error) {
 		}
 
 		defer resp.Body.Close()
-
-		return false, nil
-
 	}
 	return false, nil
 }
