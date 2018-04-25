@@ -27,6 +27,7 @@ import (
 	"github.com/prometheus/common/model"
 	"golang.org/x/net/context"
 
+	"github.com/prometheus/alertmanager/cluster"
 	"github.com/prometheus/alertmanager/config"
 	"github.com/prometheus/alertmanager/nflog"
 	"github.com/prometheus/alertmanager/nflog/nflogpb"
@@ -46,6 +47,13 @@ var (
 		Namespace: "alertmanager",
 		Name:      "notifications_failed_total",
 		Help:      "The total number of failed notifications.",
+	}, []string{"integration"})
+
+	notificationLatencySeconds = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Namespace: "alertmanager",
+		Name:      "notification_latency_seconds",
+		Help:      "The latency of notifications in seconds.",
+		Buckets:   []float64{1, 5, 10, 15, 20},
 	}, []string{"integration"})
 )
 
@@ -68,9 +76,19 @@ func init() {
 	numFailedNotifications.WithLabelValues("opsgenie")
 	numFailedNotifications.WithLabelValues("webhook")
 	numFailedNotifications.WithLabelValues("victorops")
+	notificationLatencySeconds.WithLabelValues("email")
+	notificationLatencySeconds.WithLabelValues("hipchat")
+	notificationLatencySeconds.WithLabelValues("pagerduty")
+	notificationLatencySeconds.WithLabelValues("wechat")
+	notificationLatencySeconds.WithLabelValues("pushover")
+	notificationLatencySeconds.WithLabelValues("slack")
+	notificationLatencySeconds.WithLabelValues("opsgenie")
+	notificationLatencySeconds.WithLabelValues("webhook")
+	notificationLatencySeconds.WithLabelValues("victorops")
 
 	prometheus.Register(numNotifications)
 	prometheus.Register(numFailedNotifications)
+	prometheus.Register(notificationLatencySeconds)
 }
 
 // MinTimeout is the minimum timeout that is set for the context of a call
@@ -218,15 +236,17 @@ func BuildPipeline(
 	silences *silence.Silences,
 	notificationLog NotificationLog,
 	marker types.Marker,
+	peer *cluster.Peer,
 	logger log.Logger,
 ) RoutingStage {
 	rs := RoutingStage{}
 
+	ms := NewGossipSettleStage(peer)
 	is := NewInhibitStage(muter)
 	ss := NewSilenceStage(silences, marker)
 
 	for _, rc := range confs {
-		rs[rc.Name] = MultiStage{is, ss, createStage(rc, tmpl, wait, notificationLog, logger)}
+		rs[rc.Name] = MultiStage{ms, is, ss, createStage(rc, tmpl, wait, notificationLog, logger)}
 	}
 	return rs
 }
@@ -318,10 +338,26 @@ func (fs FanoutStage) Exec(ctx context.Context, l log.Logger, alerts ...*types.A
 	return ctx, alerts, nil
 }
 
+// GossipSettleStage waits until the Gossip has settled to forward alerts.
+type GossipSettleStage struct {
+	peer *cluster.Peer
+}
+
+// NewGossipSettleStage returns a new GossipSettleStage.
+func NewGossipSettleStage(p *cluster.Peer) *GossipSettleStage {
+	return &GossipSettleStage{peer: p}
+}
+
+func (n *GossipSettleStage) Exec(ctx context.Context, l log.Logger, alerts ...*types.Alert) (context.Context, []*types.Alert, error) {
+	if n.peer != nil {
+		n.peer.WaitReady()
+	}
+	return ctx, alerts, nil
+}
+
 // InhibitStage filters alerts through an inhibition muter.
 type InhibitStage struct {
-	muter  types.Muter
-	marker types.Marker
+	muter types.Muter
 }
 
 // NewInhibitStage return a new InhibitStage.
@@ -605,7 +641,10 @@ func (r RetryStage) Exec(ctx context.Context, l log.Logger, alerts ...*types.Ale
 
 		select {
 		case <-tick.C:
-			if retry, err := r.integration.Notify(ctx, alerts...); err != nil {
+			now := time.Now()
+			retry, err := r.integration.Notify(ctx, alerts...)
+			notificationLatencySeconds.WithLabelValues(r.integration.name).Observe(time.Since(now).Seconds())
+			if err != nil {
 				numFailedNotifications.WithLabelValues(r.integration.name).Inc()
 				level.Debug(l).Log("msg", "Notify attempt failed", "attempt", i, "integration", r.integration.name, "receiver", r.groupName, "err", err)
 				if !retry {

@@ -22,7 +22,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gogo/protobuf/proto"
+	"github.com/matttproud/golang_protobuf_extensions/pbutil"
 	pb "github.com/prometheus/alertmanager/silence/silencepb"
 	"github.com/prometheus/alertmanager/types"
 	"github.com/prometheus/common/model"
@@ -187,7 +187,8 @@ func TestSilencesSetSilence(t *testing.T) {
 	done := make(chan bool)
 	s.broadcast = func(b []byte) {
 		var e pb.MeshSilence
-		err := proto.Unmarshal(b, &e)
+		r := bytes.NewReader(b)
+		_, err := pbutil.ReadDelimited(r, &e)
 		require.NoError(t, err)
 
 		require.Equal(t, want["some_id"], &e)
@@ -982,56 +983,47 @@ func TestValidateSilence(t *testing.T) {
 	}
 }
 
-func TeststateMerge(t *testing.T) {
+func TestStateMerge(t *testing.T) {
 	now := utcNow()
 
 	// We only care about key names and timestamps for the
 	// merging logic.
-	newSilence := func(ts time.Time) *pb.MeshSilence {
+	newSilence := func(id string, ts time.Time) *pb.MeshSilence {
 		return &pb.MeshSilence{
-			Silence: &pb.Silence{UpdatedAt: ts},
+			Silence: &pb.Silence{Id: id, UpdatedAt: ts},
 		}
 	}
 
 	cases := []struct {
-		a, b         state
-		final, delta state
+		a, b  state
+		final state
 	}{
 		{
 			a: state{
-				"a1": newSilence(now),
-				"a2": newSilence(now),
-				"a3": newSilence(now),
+				"a1": newSilence("a1", now),
+				"a2": newSilence("a2", now),
+				"a3": newSilence("a3", now),
 			},
 			b: state{
-				"b1": newSilence(now),                   // new key, should be added
-				"a2": newSilence(now.Add(-time.Minute)), // older timestamp, should be dropped
-				"a3": newSilence(now.Add(time.Minute)),  // newer timestamp, should overwrite
+				"b1": newSilence("b1", now),                   // new key, should be added
+				"a2": newSilence("a2", now.Add(-time.Minute)), // older timestamp, should be dropped
+				"a3": newSilence("a3", now.Add(time.Minute)),  // newer timestamp, should overwrite
 			},
 			final: state{
-				"a1": newSilence(now),
-				"a2": newSilence(now),
-				"a3": newSilence(now.Add(time.Minute)),
-				"b1": newSilence(now),
-			},
-			delta: state{
-				"b1": newSilence(now),
-				"a3": newSilence(now.Add(time.Minute)),
+				"a1": newSilence("a1", now),
+				"a2": newSilence("a2", now),
+				"a3": newSilence("a3", now.Add(time.Minute)),
+				"b1": newSilence("b1", now),
 			},
 		},
 	}
 
 	for _, c := range cases {
-		ca, cb := c.a.clone(), c.b.clone()
-
-		res := ca.clone()
-		for _, e := range cb {
-			res.merge(e)
+		for _, e := range c.b {
+			c.a.merge(e)
 		}
 
-		require.Equal(t, c.final, res, "Merge result should match expectation")
-		require.Equal(t, c.final, ca, "Merge should apply changes to original state")
-		require.Equal(t, c.b, cb, "Merged state should remain unmodified")
+		require.Equal(t, c.final, c.a, "Merge result should match expectation")
 	}
 }
 
@@ -1087,4 +1079,15 @@ func TestStateCoding(t *testing.T) {
 
 		require.Equal(t, in, out, "decoded data doesn't match encoded data")
 	}
+}
+
+func TestStateDecodingError(t *testing.T) {
+	// Check whether decoding copes with erroneous data.
+	s := state{"": &pb.MeshSilence{}}
+
+	msg, err := s.MarshalBinary()
+	require.NoError(t, err)
+
+	_, err = decodeState(bytes.NewReader(msg))
+	require.Equal(t, ErrInvalidState, err)
 }

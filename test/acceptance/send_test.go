@@ -33,7 +33,7 @@ func TestMergeAlerts(t *testing.T) {
 	conf := `
 route:
   receiver: "default"
-  group_by: []
+  group_by: [alertname]
   group_wait:      1s
   group_interval:  1s
   repeat_interval: 1ms
@@ -109,7 +109,7 @@ func TestRepeat(t *testing.T) {
 	conf := `
 route:
   receiver: "default"
-  group_by: []
+  group_by: [alertname]
   group_wait:      1s
   group_interval:  1s
   repeat_interval: 1ms
@@ -168,7 +168,7 @@ func TestRetry(t *testing.T) {
 	conf := `
 route:
   receiver: "default"
-  group_by: []
+  group_by: [alertname]
   group_wait:      1s
   group_interval:  1s
   repeat_interval: 3s
@@ -406,10 +406,9 @@ receivers:
 func TestReload(t *testing.T) {
 	t.Parallel()
 
-	// We create a notification config that fans out into two different
-	// webhooks.
-	// The succeeding one must still only receive the first successful
-	// notifications. Sending to the succeeding one must eventually succeed.
+	// This integration test ensures that the first alert isn't notified twice
+	// and repeat_interval applies after the AlertManager process has been
+	// reloaded.
 	conf := `
 route:
   receiver: "default"

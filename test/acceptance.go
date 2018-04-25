@@ -28,9 +28,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/prometheus/client_golang/api/alertmanager"
+	"github.com/prometheus/client_golang/api"
 	"github.com/prometheus/common/model"
 	"golang.org/x/net/context"
+
+	"github.com/prometheus/alertmanager/client"
 )
 
 // AcceptanceTest provides declarative definition of given inputs and expected
@@ -128,13 +130,13 @@ func (t *AcceptanceTest) Alertmanager(conf string) *Alertmanager {
 
 	t.Logf("AM on %s", am.apiAddr)
 
-	client, err := alertmanager.New(alertmanager.Config{
+	c, err := api.NewClient(api.Config{
 		Address: fmt.Sprintf("http://%s", am.apiAddr),
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	am.client = client
+	am.client = c
 
 	t.ams = append(t.ams, am)
 
@@ -167,6 +169,8 @@ func (t *AcceptanceTest) Run() {
 		defer func(am *Alertmanager) {
 			am.Terminate()
 			am.cleanup()
+			t.Logf("stdout:\n%v", am.cmd.Stdout)
+			t.Logf("stderr:\n%v", am.cmd.Stderr)
 		}(am)
 	}
 
@@ -192,11 +196,6 @@ func (t *AcceptanceTest) Run() {
 		report := coll.check()
 		t.Log(report)
 	}
-
-	for _, am := range t.ams {
-		t.Logf("stdout:\n%v", am.cmd.Stdout)
-		t.Logf("stderr:\n%v", am.cmd.Stderr)
-	}
 }
 
 // runActions performs the stored actions at the defined times.
@@ -219,6 +218,23 @@ func (t *AcceptanceTest) runActions() {
 	wg.Wait()
 }
 
+type buffer struct {
+	b   bytes.Buffer
+	mtx sync.Mutex
+}
+
+func (b *buffer) Write(p []byte) (int, error) {
+	b.mtx.Lock()
+	defer b.mtx.Unlock()
+	return b.b.Write(p)
+}
+
+func (b *buffer) String() string {
+	b.mtx.Lock()
+	defer b.mtx.Unlock()
+	return b.b.String()
+}
+
 // Alertmanager encapsulates an Alertmanager process and allows
 // declaring alerts being pushed to it at fixed points in time.
 type Alertmanager struct {
@@ -227,7 +243,7 @@ type Alertmanager struct {
 
 	apiAddr     string
 	clusterAddr string
-	client      alertmanager.Client
+	client      api.Client
 	cmd         *exec.Cmd
 	confFile    *os.File
 	dir         string
@@ -243,10 +259,11 @@ func (am *Alertmanager) Start() {
 		"--web.listen-address", am.apiAddr,
 		"--storage.path", am.dir,
 		"--cluster.listen-address", am.clusterAddr,
+		"--cluster.settle-timeout", "0s",
 	)
 
 	if am.cmd == nil {
-		var outb, errb bytes.Buffer
+		var outb, errb buffer
 		cmd.Stdout = &outb
 		cmd.Stderr = &errb
 	} else {
@@ -299,16 +316,30 @@ func (am *Alertmanager) cleanup() {
 // Push declares alerts that are to be pushed to the Alertmanager
 // server at a relative point in time.
 func (am *Alertmanager) Push(at float64, alerts ...*TestAlert) {
-	var nas model.Alerts
-	for _, a := range alerts {
-		nas = append(nas, a.nativeAlert(am.opts))
+	var cas []client.Alert
+	for i := range alerts {
+		a := alerts[i].nativeAlert(am.opts)
+		al := client.Alert{
+			Labels:       client.LabelSet{},
+			Annotations:  client.LabelSet{},
+			StartsAt:     a.StartsAt,
+			EndsAt:       a.EndsAt,
+			GeneratorURL: a.GeneratorURL,
+		}
+		for n, v := range a.Labels {
+			al.Labels[client.LabelName(n)] = client.LabelValue(v)
+		}
+		for n, v := range a.Annotations {
+			al.Annotations[client.LabelName(n)] = client.LabelValue(v)
+		}
+		cas = append(cas, al)
 	}
 
-	alertAPI := alertmanager.NewAlertAPI(am.client)
+	alertAPI := client.NewAlertAPI(am.client)
 
 	am.t.Do(at, func() {
-		if err := alertAPI.Push(context.Background(), nas...); err != nil {
-			am.t.Errorf("Error pushing %v: %s", nas, err)
+		if err := alertAPI.Push(context.Background(), cas...); err != nil {
+			am.t.Errorf("Error pushing %v: %s", cas, err)
 		}
 	})
 }
@@ -344,14 +375,14 @@ func (am *Alertmanager) SetSilence(at float64, sil *TestSilence) {
 			am.t.Errorf("error setting silence %v: %s", sil, err)
 			return
 		}
-		sil.ID = v.Data.SilenceID
+		sil.SetID(v.Data.SilenceID)
 	})
 }
 
 // DelSilence deletes the silence with the sid at the given time.
 func (am *Alertmanager) DelSilence(at float64, sil *TestSilence) {
 	am.t.Do(at, func() {
-		req, err := http.NewRequest("DELETE", fmt.Sprintf("http://%s/api/v1/silence/%s", am.apiAddr, sil.ID), nil)
+		req, err := http.NewRequest("DELETE", fmt.Sprintf("http://%s/api/v1/silence/%s", am.apiAddr, sil.ID()), nil)
 		if err != nil {
 			am.t.Errorf("Error deleting silence %v: %s", sil, err)
 			return

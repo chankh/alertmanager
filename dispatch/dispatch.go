@@ -287,9 +287,9 @@ type aggrGroup struct {
 	next    *time.Timer
 	timeout func(time.Duration) time.Duration
 
-	mtx     sync.RWMutex
-	alerts  map[model.Fingerprint]*types.Alert
-	hasSent bool
+	mtx        sync.RWMutex
+	alerts     map[model.Fingerprint]*types.Alert
+	hasFlushed bool
 }
 
 // newAggrGroup returns a new aggregation group.
@@ -366,6 +366,7 @@ func (ag *aggrGroup) run(nf notifyFunc) {
 			// Wait the configured interval before calling flush again.
 			ag.mtx.Lock()
 			ag.next.Reset(ag.opts.GroupInterval)
+			ag.hasFlushed = true
 			ag.mtx.Unlock()
 
 			ag.flush(func(alerts ...*types.Alert) bool {
@@ -396,7 +397,7 @@ func (ag *aggrGroup) insert(alert *types.Alert) {
 
 	// Immediately trigger a flush if the wait duration for this
 	// alert is already over.
-	if !ag.hasSent && alert.StartsAt.Add(ag.opts.GroupWait).Before(time.Now()) {
+	if !ag.hasFlushed && alert.StartsAt.Add(ag.opts.GroupWait).Before(time.Now()) {
 		ag.next.Reset(0)
 	}
 }
@@ -424,6 +425,26 @@ func (ag *aggrGroup) flush(notify func(...*types.Alert) bool) {
 		alertsSlice = append(alertsSlice, alert)
 	}
 
+	sort.SliceStable(alertsSlice, func(i, j int) bool {
+		// Look at labels.job, then labels.instance.
+		for _, override_key := range [...]model.LabelName{"job", "instance"} {
+			key_i, ok_i := alertsSlice[i].Labels[override_key]
+			if !ok_i {
+				return true
+			}
+			key_j, ok_j := alertsSlice[j].Labels[override_key]
+			if !ok_j {
+				return false
+			}
+
+			if key_i != key_j {
+				return key_i > key_j
+			}
+		}
+
+		return alertsSlice[i].Labels.Before(alertsSlice[j].Labels)
+	})
+
 	ag.mtx.Unlock()
 
 	level.Debug(ag.logger).Log("msg", "Flushing", "alerts", fmt.Sprintf("%v", alertsSlice))
@@ -437,8 +458,6 @@ func (ag *aggrGroup) flush(notify func(...*types.Alert) bool) {
 				delete(ag.alerts, fp)
 			}
 		}
-
-		ag.hasSent = true
 		ag.mtx.Unlock()
 	}
 }

@@ -291,7 +291,19 @@ func TestQuery(t *testing.T) {
 	require.NoError(t, err, "logging notification failed")
 
 	entries, err := nl.Query(QGroupKey("key"), QReceiver(recv))
+	require.NoError(t, err, "querying nflog failed")
 	entry := entries[0]
 	require.EqualValues(t, firingAlerts, entry.FiringAlerts)
 	require.EqualValues(t, resolvedAlerts, entry.ResolvedAlerts)
+}
+
+func TestStateDecodingError(t *testing.T) {
+	// Check whether decoding copes with erroneous data.
+	s := state{"": &pb.MeshEntry{}}
+
+	msg, err := s.MarshalBinary()
+	require.NoError(t, err)
+
+	_, err = decodeState(bytes.NewReader(msg))
+	require.Equal(t, ErrInvalidState, err)
 }

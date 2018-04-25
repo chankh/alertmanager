@@ -14,6 +14,7 @@
 package main
 
 import (
+	"context"
 	"crypto/md5"
 	"encoding/binary"
 	"fmt"
@@ -24,13 +25,11 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
-	"sort"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 
-	"github.com/alecthomas/kingpin"
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
 	"github.com/prometheus/alertmanager/api"
@@ -46,17 +45,15 @@ import (
 	"github.com/prometheus/alertmanager/types"
 	"github.com/prometheus/alertmanager/ui"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/prometheus/common/promlog"
 	"github.com/prometheus/common/route"
 	"github.com/prometheus/common/version"
 	"github.com/prometheus/prometheus/pkg/labels"
+	"gopkg.in/alecthomas/kingpin.v2"
 )
 
 var (
-	peerPosition = prometheus.NewGauge(prometheus.GaugeOpts{
-		Name: "alertmanager_peer_position",
-		Help: "Position the Alertmanager instance believes it's in. The position determines a peer's behavior in the cluster.",
-	})
 	configHash = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "alertmanager_config_hash",
 		Help: "Hash of the currently loaded alertmanager configuration.",
@@ -71,14 +68,41 @@ var (
 	})
 	alertsActive     prometheus.GaugeFunc
 	alertsSuppressed prometheus.GaugeFunc
+	requestDuration  = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "alertmanager_http_request_duration_seconds",
+			Help:    "Histogram of latencies for HTTP requests.",
+			Buckets: []float64{.05, 0.1, .25, .5, .75, 1, 2, 5, 20, 60},
+		},
+		[]string{"handler", "method"},
+	)
+	responseSize = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "alertmanager_http_response_size_bytes",
+			Help:    "Histogram of response size for HTTP requests.",
+			Buckets: prometheus.ExponentialBuckets(100, 10, 7),
+		},
+		[]string{"handler", "method"},
+	)
 )
 
 func init() {
-	prometheus.MustRegister(peerPosition)
 	prometheus.MustRegister(configSuccess)
 	prometheus.MustRegister(configSuccessTime)
 	prometheus.MustRegister(configHash)
+	prometheus.MustRegister(requestDuration)
+	prometheus.MustRegister(responseSize)
 	prometheus.MustRegister(version.NewCollector("alertmanager"))
+}
+
+func instrumentHandler(handlerName string, handler http.HandlerFunc) http.HandlerFunc {
+	return promhttp.InstrumentHandlerDuration(
+		requestDuration.MustCurryWith(prometheus.Labels{"handler": handlerName}),
+		promhttp.InstrumentHandlerResponseSize(
+			responseSize.MustCurryWith(prometheus.Labels{"handler": handlerName}),
+			handler,
+		),
+	)
 }
 
 func newAlertMetricByState(marker types.Marker, st types.AlertState) prometheus.GaugeFunc {
@@ -125,20 +149,14 @@ func main() {
 		routePrefix   = kingpin.Flag("web.route-prefix", "Prefix for the internal routes of web endpoints. Defaults to path of --web.external-url.").String()
 		listenAddress = kingpin.Flag("web.listen-address", "Address to listen on for the web interface and API.").Default(":9093").String()
 
-		clusterBindAddr = kingpin.Flag("cluster.listen-address", "listen address for cluster").
+		clusterBindAddr = kingpin.Flag("cluster.listen-address", "Listen address for cluster.").
 				Default(defaultClusterAddr).String()
-
-		clusterAdvertiseAddr = kingpin.Flag("cluster.advertise-address", "explicit address to advertise in cluster").String()
-
-		peerTimeout = kingpin.Flag("cluster.peer-timeout", "Time to wait between peers to send notifications.").Default("15s").Duration()
-
-		gossipInterval = kingpin.Flag("cluster.gossip-interval", "interval between sending gossip messages. By lowering this value (more frequent) gossip messages are propagated across the cluster more quickly at the expense of increased bandwidth.").
-				Default(cluster.DefaultGossipInterval.String()).Duration()
-
-		pushPullInterval = kingpin.Flag("cluster.pushpull-interval", "interval for gossip state syncs . Setting this interval lower (more frequent) will increase convergence speeds across larger clusters at the expense of increased bandwidth usage.").
-					Default(cluster.DefaultPushPullInterval.String()).Duration()
-
-		peers = kingpin.Flag("cluster.peer", "initial peers (may be repeated)").Strings()
+		clusterAdvertiseAddr = kingpin.Flag("cluster.advertise-address", "Explicit address to advertise in cluster.").String()
+		peers                = kingpin.Flag("cluster.peer", "Initial peers (may be repeated).").Strings()
+		peerTimeout          = kingpin.Flag("cluster.peer-timeout", "Time to wait between peers to send notifications.").Default("15s").Duration()
+		gossipInterval       = kingpin.Flag("cluster.gossip-interval", "Interval between sending gossip messages. By lowering this value (more frequent) gossip messages are propagated across the cluster more quickly at the expense of increased bandwidth.").Default(cluster.DefaultGossipInterval.String()).Duration()
+		pushPullInterval     = kingpin.Flag("cluster.pushpull-interval", "Interval for gossip state syncs. Setting this interval lower (more frequent) will increase convergence speeds across larger clusters at the expense of increased bandwidth usage.").Default(cluster.DefaultPushPullInterval.String()).Duration()
+		settleTimeout        = kingpin.Flag("cluster.settle-timeout", "Maximum time to wait for cluster connections to settle before evaluating notifications.").Default(cluster.DefaultPushPullInterval.String()).Duration()
 	)
 
 	kingpin.Version(version.Print("alertmanager"))
@@ -159,19 +177,24 @@ func main() {
 
 	var peer *cluster.Peer
 	if *clusterBindAddr != "" {
-		fmt.Println("addrs", *clusterBindAddr, *clusterAdvertiseAddr)
 		peer, err = cluster.Join(log.With(logger, "component", "cluster"), prometheus.DefaultRegisterer,
 			*clusterBindAddr,
 			*clusterAdvertiseAddr,
 			*peers,
 			true,
-			*gossipInterval,
 			*pushPullInterval,
+			*gossipInterval,
 		)
 		if err != nil {
 			level.Error(logger).Log("msg", "Unable to initialize gossip mesh", "err", err)
 			os.Exit(1)
 		}
+		ctx, cancel := context.WithTimeout(context.Background(), *settleTimeout)
+		defer func() {
+			cancel()
+			peer.Leave(10 * time.Second)
+		}()
+		go peer.Settle(ctx, *gossipInterval*10)
 	}
 
 	stopc := make(chan struct{})
@@ -185,6 +208,7 @@ func main() {
 		nflog.WithMetrics(prometheus.DefaultRegisterer),
 		nflog.WithLogger(log.With(logger, "component", "nflog")),
 	}
+
 	notificationLog, err := nflog.New(notificationLogOpts...)
 	if err != nil {
 		level.Error(logger).Log("err", err)
@@ -204,6 +228,7 @@ func main() {
 		Logger:       log.With(logger, "component", "silences"),
 		Metrics:      prometheus.DefaultRegisterer,
 	}
+
 	silences, err := silence.New(silenceOpts)
 	if err != nil {
 		level.Error(logger).Log("err", err)
@@ -223,9 +248,6 @@ func main() {
 
 	defer func() {
 		close(stopc)
-		if peer != nil {
-			peer.Leave(10 * time.Second)
-		}
 		wg.Wait()
 	}()
 
@@ -316,6 +338,7 @@ func main() {
 			silences,
 			notificationLog,
 			marker,
+			peer,
 			logger,
 		)
 		disp = dispatch.NewDispatcher(alerts, dispatch.NewRoute(conf.Route, nil), pipeline, marker, timeoutFunc, logger)
@@ -337,7 +360,7 @@ func main() {
 
 	*routePrefix = "/" + strings.Trim(*routePrefix, "/")
 
-	router := route.New()
+	router := route.New().WithInstrumentation(instrumentHandler)
 
 	if *routePrefix != "/" {
 		router = router.WithPrefix(*routePrefix)
@@ -355,7 +378,7 @@ func main() {
 	var (
 		hup      = make(chan os.Signal)
 		hupReady = make(chan bool)
-		term     = make(chan os.Signal)
+		term     = make(chan os.Signal, 1)
 	)
 	signal.Notify(hup, syscall.SIGHUP)
 	signal.Notify(term, os.Interrupt, syscall.SIGTERM)
@@ -384,20 +407,7 @@ func main() {
 // a duration of one base timeout for each peer with a higher ID than ourselves.
 func clusterWait(p *cluster.Peer, timeout time.Duration) func() time.Duration {
 	return func() time.Duration {
-		all := p.Peers()
-		sort.Slice(all, func(i, j int) bool {
-			return all[i].Name < all[j].Name
-		})
-
-		k := 0
-		for _, n := range all {
-			if n.Name == p.Self().Name {
-				break
-			}
-			k++
-		}
-		peerPosition.Set(float64(k))
-		return time.Duration(k) * timeout
+		return time.Duration(p.Position()) * timeout
 	}
 }
 

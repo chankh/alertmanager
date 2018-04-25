@@ -5,6 +5,7 @@ import (
 	"io/ioutil"
 	"math/rand"
 	"net"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -16,6 +17,7 @@ import (
 	"github.com/hashicorp/memberlist"
 	"github.com/oklog/ulid"
 	"github.com/pkg/errors"
+
 	"github.com/prometheus/alertmanager/cluster/clusterpb"
 	"github.com/prometheus/client_golang/prometheus"
 )
@@ -28,6 +30,9 @@ type Peer struct {
 	mtx    sync.RWMutex
 	states map[string]State
 	stopc  chan struct{}
+	readyc chan struct{}
+
+	logger log.Logger
 }
 
 const (
@@ -93,6 +98,8 @@ func Join(
 	p := &Peer{
 		states: map[string]State{},
 		stopc:  make(chan struct{}),
+		readyc: make(chan struct{}),
+		logger: l,
 	}
 	p.delegate = newDelegate(l, reg, p)
 
@@ -169,6 +176,30 @@ func (p *Peer) ClusterSize() int {
 	return p.mlist.NumMembers()
 }
 
+// Return true when router has settled.
+func (p *Peer) Ready() bool {
+	select {
+	case <-p.readyc:
+		return true
+	default:
+	}
+	return false
+}
+
+// Wait until Settle() has finished.
+func (p *Peer) WaitReady() {
+	<-p.readyc
+}
+
+// Return a status string representing the peer state.
+func (p *Peer) Status() string {
+	if p.Ready() {
+		return "ready"
+	} else {
+		return "settling"
+	}
+}
+
 // Info returns a JSON-serializable dump of cluster state.
 // Useful for debug.
 func (p *Peer) Info() map[string]interface{} {
@@ -189,6 +220,63 @@ func (p *Peer) Self() *memberlist.Node {
 // Peers returns the peers in the cluster.
 func (p *Peer) Peers() []*memberlist.Node {
 	return p.mlist.Members()
+}
+
+// Position returns the position of the peer in the cluster.
+func (p *Peer) Position() int {
+	all := p.Peers()
+	sort.Slice(all, func(i, j int) bool {
+		return all[i].Name < all[j].Name
+	})
+
+	k := 0
+	for _, n := range all {
+		if n.Name == p.Self().Name {
+			break
+		}
+		k++
+	}
+	return k
+}
+
+// Settle waits until the mesh is ready (and sets the appropriate internal state when it is).
+// The idea is that we don't want to start "working" before we get a chance to know most of the alerts and/or silences.
+// Inspired from https://github.com/apache/cassandra/blob/7a40abb6a5108688fb1b10c375bb751cbb782ea4/src/java/org/apache/cassandra/gms/Gossiper.java
+// This is clearly not perfect or strictly correct but should prevent the alertmanager to send notification before it is obviously not ready.
+// This is especially important for those that do not have persistent storage.
+func (p *Peer) Settle(ctx context.Context, interval time.Duration) {
+	const NumOkayRequired = 3
+	level.Info(p.logger).Log("msg", "Waiting for gossip to settle...", "interval", interval)
+	start := time.Now()
+	nPeers := 0
+	nOkay := 0
+	totalPolls := 0
+	for {
+		select {
+		case <-ctx.Done():
+			elapsed := time.Since(start)
+			level.Info(p.logger).Log("msg", "gossip not settled but continuing anyway", "polls", totalPolls, "elapsed", elapsed)
+			close(p.readyc)
+			return
+		case <-time.After(interval):
+		}
+		elapsed := time.Since(start)
+		n := len(p.Peers())
+		if nOkay >= NumOkayRequired {
+			level.Info(p.logger).Log("msg", "gossip settled; proceeding", "elapsed", elapsed)
+			break
+		}
+		if n == nPeers {
+			nOkay++
+			level.Debug(p.logger).Log("msg", "gossip looks settled", "elapsed", elapsed)
+		} else {
+			nOkay = 0
+			level.Info(p.logger).Log("msg", "gossip not settled", "polls", totalPolls, "before", nPeers, "now", n, "elapsed", elapsed)
+		}
+		nPeers = n
+		totalPolls++
+	}
+	close(p.readyc)
 }
 
 // State is a piece of state that can be serialized and merged with other
@@ -234,6 +322,8 @@ type delegate struct {
 
 	messagesReceived     *prometheus.CounterVec
 	messagesReceivedSize *prometheus.CounterVec
+	messagesSent         *prometheus.CounterVec
+	messagesSentSize     *prometheus.CounterVec
 }
 
 func newDelegate(l log.Logger, reg prometheus.Registerer, p *Peer) *delegate {
@@ -249,14 +339,50 @@ func newDelegate(l log.Logger, reg prometheus.Registerer, p *Peer) *delegate {
 		Name: "alertmanager_cluster_messages_received_size_total",
 		Help: "Total size of cluster messages received.",
 	}, []string{"msg_type"})
+	messagesSent := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "alertmanager_cluster_messages_sent_total",
+		Help: "Total number of cluster messsages sent.",
+	}, []string{"msg_type"})
+	messagesSentSize := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "alertmanager_cluster_messages_sent_size_total",
+		Help: "Total size of cluster messages sent.",
+	}, []string{"msg_type"})
 	gossipClusterMembers := prometheus.NewGaugeFunc(prometheus.GaugeOpts{
 		Name: "alertmanager_cluster_members",
 		Help: "Number indicating current number of members in cluster.",
 	}, func() float64 {
 		return float64(p.ClusterSize())
 	})
+	peerPosition := prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+		Name: "alertmanager_peer_position",
+		Help: "Position the Alertmanager instance believes it's in. The position determines a peer's behavior in the cluster.",
+	}, func() float64 {
+		return float64(p.Position())
+	})
+	healthScore := prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+		Name: "alertmanager_cluster_health_score",
+		Help: "Health score of the cluster. Lower values are better and zero means 'totally healthy'.",
+	}, func() float64 {
+		return float64(p.mlist.GetHealthScore())
+	})
+	messagesQueued := prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+		Name: "alertmanager_cluster_messages_queued",
+		Help: "Number of cluster messsages which are queued.",
+	}, func() float64 {
+		return float64(bcast.NumQueued())
+	})
 
-	reg.MustRegister(messagesReceived, messagesReceivedSize, gossipClusterMembers)
+	messagesReceived.WithLabelValues("full_state")
+	messagesReceivedSize.WithLabelValues("full_state")
+	messagesReceived.WithLabelValues("update")
+	messagesReceivedSize.WithLabelValues("update")
+	messagesSent.WithLabelValues("full_state")
+	messagesSentSize.WithLabelValues("full_state")
+	messagesSent.WithLabelValues("update")
+	messagesSentSize.WithLabelValues("update")
+
+	reg.MustRegister(messagesReceived, messagesReceivedSize, messagesSent, messagesSentSize,
+		gossipClusterMembers, peerPosition, healthScore, messagesQueued)
 
 	return &delegate{
 		logger:               l,
@@ -264,6 +390,8 @@ func newDelegate(l log.Logger, reg prometheus.Registerer, p *Peer) *delegate {
 		bcast:                bcast,
 		messagesReceived:     messagesReceived,
 		messagesReceivedSize: messagesReceivedSize,
+		messagesSent:         messagesSent,
+		messagesSentSize:     messagesSentSize,
 	}
 }
 
@@ -287,14 +415,19 @@ func (d *delegate) NotifyMsg(b []byte) {
 		return
 	}
 	if err := s.Merge(p.Data); err != nil {
-		level.Warn(d.logger).Log("msg", "merge broadcast", "err", err)
+		level.Warn(d.logger).Log("msg", "merge broadcast", "err", err, "key", p.Key)
 		return
 	}
 }
 
 // GetBroadcasts is called when user data messages can be broadcasted.
 func (d *delegate) GetBroadcasts(overhead, limit int) [][]byte {
-	return d.bcast.GetBroadcasts(overhead, limit)
+	msgs := d.bcast.GetBroadcasts(overhead, limit)
+	d.messagesSent.WithLabelValues("update").Add(float64(len(msgs)))
+	for _, m := range msgs {
+		d.messagesSentSize.WithLabelValues("update").Add(float64(len(m)))
+	}
+	return msgs
 }
 
 // LocalState is called when gossip fetches local state.
@@ -305,7 +438,7 @@ func (d *delegate) LocalState(_ bool) []byte {
 	for key, s := range d.states {
 		b, err := s.MarshalBinary()
 		if err != nil {
-			level.Warn(d.logger).Log("msg", "encode local state", "err", err)
+			level.Warn(d.logger).Log("msg", "encode local state", "err", err, "key", key)
 			return nil
 		}
 		all.Parts = append(all.Parts, clusterpb.Part{Key: key, Data: b})
@@ -315,6 +448,8 @@ func (d *delegate) LocalState(_ bool) []byte {
 		level.Warn(d.logger).Log("msg", "encode local state", "err", err)
 		return nil
 	}
+	d.messagesSent.WithLabelValues("full_state").Inc()
+	d.messagesSentSize.WithLabelValues("full_state").Add(float64(len(b)))
 	return b
 }
 
@@ -336,7 +471,7 @@ func (d *delegate) MergeRemoteState(buf []byte, _ bool) {
 			continue
 		}
 		if err := s.Merge(p.Data); err != nil {
-			level.Warn(d.logger).Log("msg", "merge remote state", "err", err)
+			level.Warn(d.logger).Log("msg", "merge remote state", "err", err, "key", p.Key)
 			return
 		}
 	}

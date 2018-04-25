@@ -831,8 +831,6 @@ type Wechat struct {
 // Wechat AccessToken with corpid and corpsecret.
 type WechatToken struct {
 	AccessToken string `json:"access_token"`
-	// Catches all undefined fields and must be empty after parsing.
-	XXX map[string]interface{} `json:"-"`
 }
 
 type weChatMessage struct {
@@ -1153,11 +1151,6 @@ type victorOpsMessage struct {
 	EntityDisplayName string `json:"entity_display_name"`
 	StateMessage      string `json:"state_message"`
 	MonitoringTool    string `json:"monitoring_tool"`
-}
-
-type victorOpsErrorResponse struct {
-	Result  string `json:"result"`
-	Message string `json:"message"`
 }
 
 // Notify implements the Notifier interface.

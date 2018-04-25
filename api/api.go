@@ -56,6 +56,9 @@ var (
 )
 
 func init() {
+	numReceivedAlerts.WithLabelValues("firing")
+	numReceivedAlerts.WithLabelValues("resolved")
+
 	prometheus.Register(numReceivedAlerts)
 	prometheus.Register(numInvalidAlerts)
 }
@@ -121,32 +124,32 @@ func New(
 // Register registers the API handlers under their correct routes
 // in the given router.
 func (api *API) Register(r *route.Router) {
-	ihf := func(name string, f http.HandlerFunc) http.HandlerFunc {
-		return prometheus.InstrumentHandlerFunc(name, func(w http.ResponseWriter, r *http.Request) {
+	wrap := func(f http.HandlerFunc) http.HandlerFunc {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			setCORS(w)
 			f(w, r)
 		})
 	}
 
-	r.Options("/*path", ihf("options", func(w http.ResponseWriter, r *http.Request) {}))
+	r.Options("/*path", wrap(func(w http.ResponseWriter, r *http.Request) {}))
 
 	// Register legacy forwarder for alert pushing.
-	r.Post("/alerts", ihf("legacy_add_alerts", api.legacyAddAlerts))
+	r.Post("/alerts", wrap(api.legacyAddAlerts))
 
 	// Register actual API.
 	r = r.WithPrefix("/v1")
 
-	r.Get("/status", ihf("status", api.status))
-	r.Get("/receivers", ihf("receivers", api.receivers))
-	r.Get("/alerts/groups", ihf("alert_groups", api.alertGroups))
+	r.Get("/status", wrap(api.status))
+	r.Get("/receivers", wrap(api.receivers))
+	r.Get("/alerts/groups", wrap(api.alertGroups))
 
-	r.Get("/alerts", ihf("list_alerts", api.listAlerts))
-	r.Post("/alerts", ihf("add_alerts", api.addAlerts))
+	r.Get("/alerts", wrap(api.listAlerts))
+	r.Post("/alerts", wrap(api.addAlerts))
 
-	r.Get("/silences", ihf("list_silences", api.listSilences))
-	r.Post("/silences", ihf("add_silence", api.setSilence))
-	r.Get("/silence/:sid", ihf("get_silence", api.getSilence))
-	r.Del("/silence/:sid", ihf("del_silence", api.delSilence))
+	r.Get("/silences", wrap(api.listSilences))
+	r.Post("/silences", wrap(api.setSilence))
+	r.Get("/silence/:sid", wrap(api.getSilence))
+	r.Del("/silence/:sid", wrap(api.delSilence))
 }
 
 // Update sets the configuration string to a new value.
@@ -164,8 +167,8 @@ type errorType string
 
 const (
 	errorNone     errorType = ""
-	errorInternal           = "server_error"
-	errorBadData            = "bad_data"
+	errorInternal errorType = "server_error"
+	errorBadData  errorType = "bad_data"
 )
 
 type apiError struct {
@@ -224,15 +227,16 @@ type peerStatus struct {
 }
 
 type clusterStatus struct {
-	Name  string       `json:"name"`
-	Peers []peerStatus `json:"peers"`
+	Name   string       `json:"name"`
+	Status string       `json:"status"`
+	Peers  []peerStatus `json:"peers"`
 }
 
 func getClusterStatus(p *cluster.Peer) *clusterStatus {
 	if p == nil {
 		return nil
 	}
-	s := &clusterStatus{Name: p.Name()}
+	s := &clusterStatus{Name: p.Name(), Status: p.Status()}
 
 	for _, n := range p.Peers() {
 		s.Peers = append(s.Peers, peerStatus{
@@ -495,6 +499,8 @@ func (api *API) insertAlerts(w http.ResponseWriter, r *http.Request, alerts ...*
 		validationErrs = &types.MultiError{}
 	)
 	for _, a := range alerts {
+		removeEmptyLabels(a.Labels)
+
 		if err := a.Validate(); err != nil {
 			validationErrs.Add(err)
 			numInvalidAlerts.Inc()
@@ -519,6 +525,14 @@ func (api *API) insertAlerts(w http.ResponseWriter, r *http.Request, alerts ...*
 	}
 
 	api.respond(w, nil)
+}
+
+func removeEmptyLabels(ls model.LabelSet) {
+	for k, v := range ls {
+		if string(v) == "" {
+			delete(ls, k)
+		}
+	}
 }
 
 func (api *API) setSilence(w http.ResponseWriter, r *http.Request) {
@@ -694,11 +708,17 @@ func matchFilterLabels(matchers []*labels.Matcher, sms map[string]string) bool {
 	for _, m := range matchers {
 		v, prs := sms[m.Name]
 		switch m.Type {
-		case labels.MatchNotEqual, labels.MatchNotRegexp:
+		case labels.MatchNotRegexp, labels.MatchNotEqual:
+			if string(m.Value) == "" && prs {
+				continue
+			}
 			if !m.Matches(string(v)) {
 				return false
 			}
 		default:
+			if string(m.Value) == "" && !prs {
+				continue
+			}
 			if !prs || !m.Matches(string(v)) {
 				return false
 			}
@@ -765,7 +785,7 @@ type status string
 
 const (
 	statusSuccess status = "success"
-	statusError          = "error"
+	statusError   status = "error"
 )
 
 type response struct {
